@@ -12,7 +12,7 @@ class Config:
 
     # Market maker parameters
     INITIAL_CAPITAL = 1000000 # Initial capital
-    BASE_SPREAD = 0.10 # Base spread (x * 100 cents)
+    BASE_SPREAD = 0.20 # Base spread 
     QUOTE_SIZE = 1000 # Default size for quotes (10 lots)
     MAX_INVENTORY = 10000 # Maximum position size (long or short)
     INVENTORY_SKEW_FACTOR = 0.0001 # How much to adjust spread based on inventory
@@ -47,6 +47,6 @@ class Config:
 
     # Participant parameters
     NUMB_INFORMED_TRADERS = 2 # Number of informed traders
-    NUMB_NOISE_TRADERS = 3 # Number of noise traders
+    NUMB_NOISE_TRADERS = 20 # Number of noise traders
     NUMB_ARBITRAGEURS = 1 # Number of arbitrageurs
     NUMB_MOMENTUM_TRADERS = 1 # Number of momentum traders

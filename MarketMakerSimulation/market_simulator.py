@@ -47,6 +47,11 @@ class MarketSimulator:
         self.mm_pnl_history = []
         self.mm_inventory_history = []
 
+        # Price impact tracking
+        self.price_history_buffer = [] # Store recent prices for impact calculation
+        self.pending_impact_measurements = [] # Store pending impact measurements
+        self.impact_measurement_delay = 10 # Ticks to wait before measuring impact
+
     
     def simulate_price_dynamics(self):
         """ Simulate underlying fair value changes """
@@ -102,11 +107,40 @@ class MarketSimulator:
         # Only check trades from current tick
         current_tick_trades = [trade for trade in self.order_book.trade_history 
                               if trade['timestamp'] == self.current_tick]
+        
         for trade in current_tick_trades:
             if trade['buy_trader'] == self.market_maker.trader_id or trade['sell_trader'] == self.market_maker.trader_id:
                 self.market_maker.on_trade(trade)
 
-                
+                # Schedule price impact measurement
+                self.pending_impact_measurements.append({
+                    'trade': trade,
+                    'measure_at_tick': self.current_tick + self.impact_measurement_delay,
+                })
+
+
+    def track_price_impact(self):
+        """ Measure price impact of trades after a delay """
+
+        current_price = self.order_book.get_book_depth()['mid_price']
+
+        # Check pending impact measurements
+        completed_measurements = []
+        for pending in self.pending_impact_measurements:
+            if self.current_tick >= pending['measure_at_tick']:
+                # Measure impact now
+                trade = pending['trade']
+                self.market_maker.track_trade_outcome(
+                    trade,
+                    current_price
+                )
+                completed_measurements.append(pending)
+
+        # Remove completed measurements
+        for completed in completed_measurements:
+            self.pending_impact_measurements.remove(completed)
+
+
     def update_tracking(self):
         """ Update tracking variables """
 
@@ -153,6 +187,9 @@ class MarketSimulator:
         # Update tracking
         self.update_tracking()
 
+        # Track price impacts for adverse selection detection
+        self.track_price_impact()
+
 
     def run_simulation(self):
         """ Run the full simulation """
@@ -179,6 +216,17 @@ class MarketSimulator:
                 print(f"Total trades: {len(self.order_book.trade_history)}")
                 print(f"MM trades executed: {len(self.market_maker.trades_executed)}")
                 print(f"Active buy orders: {mm_metrics['active_buy_orders']}, Active sell orders: {mm_metrics['active_sell_orders']}")
+                print(f"Market regime: {mm_metrics['market_regime']}")
+                print(f"Realized volatility: {mm_metrics['realized_volatility']}")
+                print(f"Trade intensity: {mm_metrics['trade_intensity']}")
+                print(f"Book imbalance: {mm_metrics['book_imbalance']}")
+                print(f"Dynamic spread: {mm_metrics['current_spread']}")
+
+                if self.market_maker.trader_toxicity_scores:
+                    toxic_traders = [tid for tid, score in self.market_maker.trader_toxicity_scores.items() if score > self.market_maker.adverse_selection_threshold]
+                    avg_toxicity = sum(self.market_maker.trader_toxicity_scores.values()) / len(self.market_maker.trader_toxicity_scores)
+                    print(f"Adverse selection detected: {len(toxic_traders)} toxic traders, Avg toxicity: {avg_toxicity:.2f}")
+
                 print("\n")
 
         print("Simulation complete")
@@ -201,6 +249,8 @@ class MarketSimulator:
             'total_trades': len(self.order_book.trade_history),
             'trade_history': self.order_book.trade_history,
             'final_order_book': self.order_book.get_book_depth(),
+            'trader_toxicity_scores': self.market_maker.trader_toxicity_scores,
+            'trader_history': self.market_maker.trader_history,
         }
 
         return results
