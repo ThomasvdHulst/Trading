@@ -108,6 +108,11 @@ class MarketSimulator:
         current_tick_trades = [trade for trade in self.order_book.trade_history 
                               if trade['timestamp'] == self.current_tick]
         
+        # First, detect if it is a sweep
+        #if self.market_maker.detect_sweep(current_tick_trades):
+        #    print(f"Market maker detected a sweep on tick {self.current_tick}")
+        self.market_maker.detect_sweep(current_tick_trades)
+        
         for trade in current_tick_trades:
             if trade['buy_trader'] == self.market_maker.trader_id or trade['sell_trader'] == self.market_maker.trader_id:
                 self.market_maker.on_trade(trade)
@@ -226,6 +231,15 @@ class MarketSimulator:
                     toxic_traders = [tid for tid, score in self.market_maker.trader_toxicity_scores.items() if score > self.market_maker.adverse_selection_threshold]
                     avg_toxicity = sum(self.market_maker.trader_toxicity_scores.values()) / len(self.market_maker.trader_toxicity_scores)
                     print(f"Adverse selection detected: {len(toxic_traders)} toxic traders, Avg toxicity: {avg_toxicity:.2f}")
+
+                if hasattr(self.market_maker, 'active_bid_levels'):
+                    num_bid_levels = len(self.market_maker.active_bid_levels)
+                    num_ask_levels = len(self.market_maker.active_ask_levels)
+                    print(f"Active levels: {num_bid_levels} bids, {num_ask_levels} asks")
+
+                if hasattr(self.market_maker, 'recent_sweeps') and self.market_maker.recent_sweeps:
+                    recent_sweep_count = len([s for s in self.market_maker.recent_sweeps if s['tick'] > tick - 100])
+                    print(f"Recent sweeps: {recent_sweep_count}")
 
                 print("\n")
 

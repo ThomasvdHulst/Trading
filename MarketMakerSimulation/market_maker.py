@@ -3,8 +3,7 @@
 # Import used libraries
 from order_book import Side
 import numpy as np
-from collections import deque
-
+from collections import deque, Counter
 
 class MarketMaker:
     """ Basic Market Maker strategy """
@@ -30,6 +29,7 @@ class MarketMaker:
         # Risk metrics
         self.max_inventory_held = 0 # Max inventory held is the maximum number of shares we have held
         self.min_inventory_held = 0 # Min inventory held is the minimum number of shares we have held
+        self.risk_limit_exceeded = False # Risk limit exceeded is a flag to indicate if the risk limit has been exceeded
 
         # Performance tracking
         self.trades_executed = [] # Trades executed is the list of trades that have been executed
@@ -38,6 +38,8 @@ class MarketMaker:
         self.current_mid_price = config.INITIAL_PRICE
         self.volatility_estimate = config.VOLATILITY
 
+
+        # PARAMETERS FOR ADVERSE SELECTION 
         # Adverse selection tracking
         self.trader_history = {} # trader_id -> list of trade outcomes
         self.trader_toxicity_scores = {} # trader_id -> toxicity score (0-1)
@@ -49,6 +51,8 @@ class MarketMaker:
         self.post_trade_price_impacts = [] # Track price movements after trades
         self.adverse_selection_threshold = 0.6 # Threshold for adverse selection
 
+
+        # PARAMETERS FOR DYNAMIC SPREAD CALCULATION
         # Dynamic spread calculation
         self.price_history = deque(maxlen=100) # Track recent prices for volatility
         self.spread_history = deque(maxlen=50) # Track recent spreads
@@ -71,6 +75,25 @@ class MarketMaker:
         self.bid_ask_imbalance = 0
 
 
+        # PARAMETERS FOR MULTI-LEVEL ORDER BOOK CALCULATION
+        # Multi-level order book parameters
+        self.num_levels = min(config.MAX_ORDERS_PER_SIDE, 3) # Start with 3 levels
+        self.level_spacing = config.TICK_SIZE * 2 # Space between order levels
+        self.base_level_size = config.QUOTE_SIZE # Base level size (size for first level)
+
+        # Sweep detection
+        self.recent_sweeps = deque(maxlen=20) # Track aggressive orders
+        self.sweep_threshold = 2 # Levels hit to consider it a sweep
+        self.last_sweep_time = 0 # Time of last sweep
+        self.sweep_cooldown = 20 # Ticks to be defensive after a sweep
+
+        # Level sizing strategy
+        self.sizing_strategy = "defensive" # aggressive, defensive, balanced
+
+        # Track order levels for analysis
+        self.active_bid_levels = {} # price -> (order_id, size)
+        self.active_ask_levels = {} # price -> (order_id, size)
+
     
     def update_quotes(self, order_book, market_state=None):
         """ Update market maker quotes based on current market conditions """
@@ -87,52 +110,33 @@ class MarketMaker:
         # Cancel all existing orders first
         self.cancel_all_orders(order_book)
 
+        # Clear level tracking
+        self.active_bid_levels.clear()
+        self.active_ask_levels.clear()
+
         # Get current market data
         book_depth = order_book.get_book_depth()
         self.current_mid_price = book_depth['mid_price']
 
-        # Calculate quote prices
-        bid_price, ask_price = self._calculate_quote_prices(book_depth)
+        # Check if we should quote (risk limits)
+        if not self._check_risk_limits():
+            if not self.risk_limit_exceeded:
+                print(f"Risk limits exceeded, stopping quoting - From now on, we are not participating in the market")
+                self.risk_limit_exceeded = True
+            return
 
-        # Calculate quote sizes
-        bid_size, ask_size = self._calculate_quote_sizes()
+        # Detect if we're in post-sweep defensive mode
+        in_defensive_mode = (self.current_tick - self.last_sweep_time) < self.sweep_cooldown
 
-        #print(f"Bid price: {bid_price}, Ask price: {ask_price}")
-        #print(f"Bid size: {bid_size}, Ask size: {ask_size}")
-        #print(f"Mid price: {self.current_mid_price}")
-       # print(f"Inventory: {self.inventory}")
-        #print('--------------------------------')
+        # Calculate base quotes (first level)
+        base_bid, base_ask = self._calculate_quote_prices(book_depth)
 
-        # Check risk limits before placing new orders
-        # If we are at risk limits, we do not place any new orders
-        #if self._check_risk_limits():
-        if True:
+        # Generate multi-level quotes
+        bid_levels = self._generate_bid_ladder(base_bid, in_defensive_mode)
+        ask_levels = self._generate_ask_ladder(base_ask, in_defensive_mode)
 
-            # Place buy order
-            if bid_size > 0 and bid_price > 0:
-                order_id = order_book.add_order(
-                    side = Side.BUY,
-                    price = bid_price,
-                    quantity = bid_size,
-                    trader_id = self.trader_id
-                )
-
-                # The add order function returns -1 if the order is invalid
-                if order_id > 0:
-                    self.buy_orders[order_id] = (bid_price, bid_size)
-
-            # Place sell order
-            if ask_size > 0 and ask_price > 0:
-                order_id = order_book.add_order(
-                    side = Side.SELL,
-                    price = ask_price,
-                    quantity = ask_size,
-                    trader_id = self.trader_id
-                )
-
-                # The add order function returns -1 if the order is invalid
-                if order_id > 0:
-                    self.sell_orders[order_id] = (ask_price, ask_size)
+        # Place order for each level
+        self._place_ladder_orders(bid_levels, ask_levels, order_book)
 
         
     def _calculate_quote_prices(self, book_depth):
@@ -159,19 +163,6 @@ class MarketMaker:
         bid_price = mid_price - half_spread - inventory_skew - imbalance_skew
         ask_price = mid_price + half_spread - inventory_skew + imbalance_skew
 
-        # Adjust for market regime
-        #if self.market_regime == "trending":
-        #    # In trending market, fade the trend
-        #    trend_adjustment = (self.price_history[-1] - self.price_history[-10]) if len(self.price_history) > 10 else 0
-        #    if trend_adjustment > 0: # Up trend
-        #        # Be more willing to sell (lower ask), less willing to buy (higher bid)
-        #        ask_price -= half_spread * 0.1
-        #        bid_price -= half_spread * 0.2
-        #    else: # Down trend
-        #        # Be more willing to buy (higher bid), less willing to sell (lower ask)
-        #        bid_price += half_spread * 0.1
-        #        ask_price += half_spread * 0.2
-
         # Ensure minimum spread
         if ask_price - bid_price < self.min_spread:
             mid = (ask_price + bid_price) / 2
@@ -183,8 +174,251 @@ class MarketMaker:
         ask_price = round(ask_price / self.config.TICK_SIZE) * self.config.TICK_SIZE
 
         return bid_price, ask_price
+    
+
+    def _generate_bid_ladder(self, base_bid, defensive_mode):
+        """ Generate multiple bid levels with appropriate sizing """
+
+        levels = []
+
+        # Determine sizing strategy based on market conditions
+        sizing = self._calculate_level_sizes(defensive_mode)
+
+        for i in range(self.num_levels):
+            # Calculate price for this level
+            # Each level is slightly worse (lower for bids)
+            level_price = base_bid - (i * self.level_spacing)
+
+            # Adjust size based on inventory
+            size = sizing[i]
+            if self.inventory > self.config.MAX_INVENTORY * 0.8:
+                # Reduce bid size when already long
+                size = int(size * 0.3)
+            elif self.inventory > self.config.MAX_INVENTORY * 0.5:
+                size = int(size * 0.7)
+
+            # Skip if size is too small
+            if size < self.config.LOT_SIZE:
+                continue
+
+            # Round to lot size
+            size = int(size / self.config.LOT_SIZE) * self.config.LOT_SIZE
+
+            levels.append({
+                'price': level_price,
+                'size': size,
+                'level': i,
+            })
+
+        return levels
+    
+
+    def _generate_ask_ladder(self, base_ask, defensive_mode):
+        """ Generate multiple ask levels with appropriate sizing """
+
+        levels = []
+
+        # Determine sizing strategy based on market conditions
+        sizing = self._calculate_level_sizes(defensive_mode)
+
+        for i in range(self.num_levels):
+            # Calculate price for this level
+            # Each level is slightly worse (higher for asks)
+            level_price = base_ask + (i * self.level_spacing)
+
+            # Adjust size based on inventory
+            size = sizing[i]
+            if self.inventory < -self.config.MAX_INVENTORY * 0.8:
+                # Reduce ask size when already short
+                size = int(size * 0.3)
+            elif self.inventory < -self.config.MAX_INVENTORY * 0.5:
+                size = int(size * 0.7)
+
+            # Skip if size is too small
+            if size < self.config.LOT_SIZE:
+                continue
+
+            # Round to lot size
+            size = int(size / self.config.LOT_SIZE) * self.config.LOT_SIZE
+
+            levels.append({
+                'price': level_price,
+                'size': size,
+                'level': i,
+            })
+
+        return levels
+    
+
+    def _calculate_level_sizes(self, defensive_mode):
+        """ Calculate size for each level based on strategy """
+
+        base_size = self.base_level_size
+        sizes = []
+
+        if defensive_mode or len(self.recent_sweeps) > 5:
+            # Defensive: Less size at best level, more at worse levels
+            # Protect against adverse selection
+            sizes = [
+                base_size * 0.3, # Small at best price
+                base_size * 0.6, # Medium at middle
+                base_size * 1.0, # Large at worst price
+            ]
+
+        elif self.sizing_strategy == "aggressive":
+            # Aggressive: More size at best level, less at worse levels
+            # Maximizes volume capture
+            sizes = [
+                base_size * 1.0, # Large at best price
+                base_size * 0.6, # Medium at middle
+                base_size * 0.3, # Small at worst price
+            ]
+
+        else:
+            # Balanced: Even distribution, with slight taper
+            sizes = [
+                base_size * 0.8,
+                base_size * 0.7,
+                base_size * 0.5
+            ]
+
+        # Adjust based on recent toxicity
+        avg_toxicity = np.mean(list(self.trader_toxicity_scores.values())) if self.trader_toxicity_scores else 0.5
+        if avg_toxicity > self.adverse_selection_threshold:
+            # Reduce first level size when facing toxic flow
+            sizes[0] *= 0.5
+
+        return sizes
+    
+
+    def _place_ladder_orders(self, bid_levels, ask_levels, order_book):
+        """ Place multi-level orders """
+
+        # Place bid orders
+        for bid in bid_levels:
+            order_id = order_book.add_order(
+                side = Side.BUY,
+                price = bid['price'],
+                quantity = bid['size'],
+                trader_id = self.trader_id,
+            )
+
+            if order_id > 0:
+                self.buy_orders[order_id] = (bid['price'], bid['size'])
+                self.active_bid_levels[bid['price']] = (order_id, bid['size'], bid['level'])
+
+        # Place ask orders
+        for ask in ask_levels:
+            order_id = order_book.add_order(
+                side = Side.SELL,
+                price = ask['price'],
+                quantity = ask['size'],
+                trader_id = self.trader_id,
+            )
+
+            if order_id > 0:
+                self.sell_orders[order_id] = (ask['price'], ask['size'])
+                self.active_ask_levels[ask['price']] = (order_id, ask['size'], ask['level'])
+
+  
+    def detect_sweep(self, trades_in_tick):
+        """ Detect if someone is sweeping through our levels """
+        
+        if not trades_in_tick:
+            return False
+        
+        # Track unique PRICE LEVELS hit (not orders, not trades)
+        bid_prices_hit = set()
+        ask_prices_hit = set()
+        
+        # Also track details for analysis
+        bid_volume_by_price = {}
+        ask_volume_by_price = {}
+        
+        for trade in trades_in_tick:
+            # Normalize price to avoid float issues
+            price_normalized = round(trade['price'] / self.config.TICK_SIZE) * self.config.TICK_SIZE
+            
+            if trade['buy_trader'] == self.trader_id:
+                # Someone hit our bid
+                bid_prices_hit.add(price_normalized)
+                bid_volume_by_price[price_normalized] = bid_volume_by_price.get(price_normalized, 0) + trade['quantity']
+                
+            elif trade['sell_trader'] == self.trader_id:
+                # Someone hit our ask
+                ask_prices_hit.add(price_normalized)
+                ask_volume_by_price[price_normalized] = ask_volume_by_price.get(price_normalized, 0) + trade['quantity']
+        
+        # Count distinct price levels (not number of trades!)
+        num_bid_levels = len(bid_prices_hit)
+        num_ask_levels = len(ask_prices_hit)
+        
+        # Sweep = multiple PRICE LEVELS on same side
+        bid_sweep = num_bid_levels >= self.sweep_threshold
+        ask_sweep = num_ask_levels >= self.sweep_threshold
+        
+        if bid_sweep or ask_sweep:
+            if bid_sweep:
+                swept_side = 'bid'
+                levels_hit = num_bid_levels
+                total_volume = sum(bid_volume_by_price.values())
+                swept_trades = [t for t in trades_in_tick if t['buy_trader'] == self.trader_id]
+            else:
+                swept_side = 'ask'
+                levels_hit = num_ask_levels
+                total_volume = sum(ask_volume_by_price.values())
+                swept_trades = [t for t in trades_in_tick if t['sell_trader'] == self.trader_id]
+            
+            sweep_info = {
+                'tick': self.current_tick,
+                'side': swept_side,
+                'num_levels': levels_hit,  # Number of PRICE LEVELS
+                'total_volume': total_volume,
+                'aggressor': self._identify_aggressor(swept_trades)
+            }
+            
+            self.recent_sweeps.append(sweep_info)
+            self.last_sweep_time = self.current_tick
+            
+            # Update toxicity
+            if sweep_info['aggressor']:
+                self._mark_trader_toxic(sweep_info['aggressor'])
+            
+            return True
+        
+        return False
+    
+    
+    def _identify_aggressor(self, trades):
+        """ Identify the trader who initiated the sweep """
+        
+        # Find the counterparty that appears most
+        counterparties = []
+        for trade in trades:
+            if trade['buy_trader'] == self.trader_id:
+                counterparties.append(trade['sell_trader'])
+            else:
+                counterparties.append(trade['buy_trader'])
+
+        if counterparties:
+            # Return the most frequent counterparty
+            return Counter(counterparties).most_common(1)[0][0]
+        
+        return None
+    
+
+    def _mark_trader_toxic(self, trader_id):
+        """ Mark a trader as toxic based on their trading behavior """
+
+        if trader_id not in self.trader_toxicity_scores:
+            self.trader_toxicity_scores[trader_id] = 0.7
+        else:
+            # Increase toxicity score
+            current = self.trader_toxicity_scores[trader_id]
+            self.trader_toxicity_scores[trader_id] = min(0.9, current + 0.1)
 
 
+    # Old function for quoting sizes, only based on 1 level....
     def _calculate_quote_sizes(self):
         """ Calculate quote sizes based on inventory and risk limits """
 
@@ -265,6 +499,21 @@ class MarketMaker:
 
         price = trade['price']
         quantity = trade['quantity']
+
+        # Track which level got hit
+        level_hit = None
+        if trade['buy_trader'] == self.trader_id:
+            # We bought - check if we hit an active bid level
+            for bid_price, (oid, size, level) in self.active_bid_levels.items():
+                if abs(price - bid_price) <= 0.0001: # Float comparison
+                    level_hit = level
+                    break
+        elif trade['sell_trader'] == self.trader_id:
+            # We sold - check if we hit an active ask level
+            for ask_price, (oid, size, level) in self.active_ask_levels.items():
+                if abs(price - ask_price) <= 0.0001: # Float comparison
+                    level_hit = level
+                    break
         
         # Remove filled orders from our tracking
         if trade['buy_trader'] == self.trader_id:
@@ -327,7 +576,8 @@ class MarketMaker:
                 'side': 'buy',
                 'price': price,
                 'quantity': quantity,
-                'inventory_after': self.inventory
+                'inventory_after': self.inventory,
+                'level_hit': level_hit
             })
 
         # If we sold
@@ -377,7 +627,8 @@ class MarketMaker:
                 'side': 'sell',
                 'price': price,
                 'quantity': quantity,
-                'inventory_after': self.inventory
+                'inventory_after': self.inventory,
+                'level_hit': level_hit
             })
             
         # Update inventory limits

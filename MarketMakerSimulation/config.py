@@ -12,7 +12,7 @@ class Config:
 
     # Market maker parameters
     INITIAL_CAPITAL = 1000000 # Initial capital
-    BASE_SPREAD = 0.20 # Base spread 
+    BASE_SPREAD = 0.10 # Base spread 
     QUOTE_SIZE = 1000 # Default size for quotes (10 lots)
     MAX_INVENTORY = 10000 # Maximum position size (long or short)
     INVENTORY_SKEW_FACTOR = 0.0001 # How much to adjust spread based on inventory
